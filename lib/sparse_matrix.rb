@@ -1,155 +1,240 @@
 require 'generator'
 
-class SparseMatrix
+class Smatrix
   
-  Comparators = {
-    :row => proc{|a,b| (s = a[0] <=> b[0]) == 0 ? (a[1] <=> b[1]) : s},
-    :column => proc{|a,b| (s = a[1] <=> b[1]) == 0 ? (a[0] <=> b[0]) : s}
-  }
+  def self.swap_direction(direction)
+    direction == :row ? :column : :row
+  end
+  
+  class P
+    
+    attr_accessor :row, :column
+    
+    def initialize(row, column)
+      @row = row
+      @column = column
+    end
+    
+    def self.[](row, column)
+      P.new(row, column)
+    end
+    
+    def compare(o, type = :row)
+      case type
+      when :row
+        (s = @row <=> o.row) == 0 ? (@column <=> o.column) : s
+      when :column
+        (s = @column <=> o.column) == 0 ? (@row <=> o.row) : s
+      else
+        raise "type: #{type} unrecognized"
+      end
+    end
+    
+    def incr(direction, row_size, column_size)
+      case direction
+      when :row
+        if @column >= column_size
+          P[@row + 1, 1]
+        elsif @column < column_size && @row <= row_size
+          P[@row, @column + 1]
+        else
+          nil
+        end
+      when :column
+        if @row >= row_size
+          P[1, @column + 1]
+        elsif @row < row_size && @column <= column_size
+          P[@row + 1, @column]
+        else
+          nil
+        end
+      end
+    end
+     
+    def reverse
+      P[@column, @row]
+    end
+
+    def hash
+      [@row, @column].hash
+    end 
+
+    def ==(p)
+      p && (p.row == @row && p.column == @column)
+    end
+
+    def to_s
+      "#{@row}, #{@column}"
+    end
+  end
   
   class InMemory
     
     attr_accessor :values
     
     def initialize(values = {})
-      @values = values
+      @values = {}
+      values.each{|k,v| @values[P[k.first, k.last]] = v}
     end
 
-    def by_column
-      Generator.new(@values.keys.sort(&Comparators[:column]).collect{|k| [k, @values[k]]})
+    def by(direction)
+      Generator.new(@values.keys.sort{|a,b| a.compare(b, direction)}.collect{|k| [k, @values[k]]})
     end
-    
-    def by_row
-      Generator.new(@values.keys.sort(&Comparators[:row]).collect{|k| [k, @values[k]]})
-    end
-    
   end
   
-  class MultiGeneratorGenerator
-    def initialize(generators, direction = :rows)
-      @generators = generators
-      @direction = direction
-    end
-    
-    def current
-      @current || self.next
-    end
-    
-    def next
-      @generators.delete_if{|i| not i.next?}
-      raise if @generators.empty?
-      coords = @generators.collect{|i| @direction == :rows ? i.current.first : i.current.first.reverse }
-      min = @direction == :rows ? coords.min : coords.min.reverse
-      @generators.each do |i|
-        if i.current.first == min
-          @current = i.current
-          i.next
-          return @current
-        end
-      end
-    end
-    
-    def next?
-      @generators.any?{|i| i.next?}
-    end
-    
-    def each
-      while next?
-        yield self.next
-      end
-    end
-    
-  end
-
   class SexpGenerator
-    def initialize(matrix, direction = :rows)
-      @generators = generators
-      @direction = direction
+    
+    attr_reader :direction
+    
+    def swap_direction
+      Smatrix.swap_direction(@direction)
+    end
+    
+    def initialize(matrix, options = {})
+      options[:direction] ||= :row
+
+      @sexp = matrix.sexp
+      @direction = options.delete(:direction)
+      
+      @current = nil
+      @generators = []
+      case @sexp.size
+      when 1:
+        @matrix = @sexp.first
+        @generators << (@gen = @matrix.generator.by(direction))
+      when 3:
+        @op = @sexp.first
+        case @op
+        when :+, :-
+          @lmatrix = @sexp[1]
+          @generators << (@lgen = @lmatrix.by(direction))
+          @rmatrix = @sexp[2]
+          @generators << (@rgen = @rmatrix.by(direction))
+        when :*, :/
+          @lmatrix = @sexp[1]
+          @generators << (@lgen = @lmatrix.by(direction))
+          @rmatrix = @sexp[2]
+          @generators << (@rgen = @rmatrix.by(swap_direction))
+        end
+      end
     end
     
     def current
-      @current || self.next
+      self.next unless @pos
+      @current
     end
     
     def next
-      @generators.delete_if{|i| not i.next?}
-      raise if @generators.empty?
-      coords = @generators.collect{|i| @direction == :rows ? i.current.first : i.current.first.reverse }
-      min = @direction == :rows ? coords.min : coords.min.reverse
-      @generators.each do |i|
-        if i.current.first == min
-          @current = i.current
-          i.next
-          return @current
+      if @op
+        case @op
+        when :+, :-
+          if @lgen.end? || @rgen.end?
+            if @lgen.end?
+              @current = @rgen.next
+            elsif @rgen.end?
+              @current = @lgen.next
+            end
+          else
+            case @lgen.current.first.compare(@rgen.current.first)
+            when -1
+              @current = @lgen.current
+              @lgen.next if @lgen.next?
+            when 1
+              @current = @rgen.current
+              @rgen.next if @rgen.next?
+            when 0
+              @current = [@lgen.current.first, @lgen.current.last.send(@op, @rgen.current.last)]
+              @lgen.next if @lgen.next?
+              @rgen.next if @rgen.next?
+            end
+          end
+          @pos = @current.first
+        when :*
+          if !@lgen.end? && @rgen.end?
+            @pos = @lgen.current.first
+            @lgen.next
+          elsif @lgen.end? && !@rgen.end?
+            @pos = @rgen.current.first.reverse
+            @rgen.next
+          else
+            case @lgen.current.first.compare(@rgen.current.first.reverse)
+            when 1
+              @pos = @rgen.current.first.reverse
+              @rgen.next if @rgen.next?
+            when -1
+              @pos = @lgen.current.first
+              @lgen.next if @lgen.next?
+            when 0
+              @pos = @lgen.current.first
+              @lgen.next if @lgen.next?
+              @rgen.next if @rgen.next?
+            end
+          end
+          
+          lgen_local = @lmatrix.by(direction)
+          rgen_local = @rmatrix.by(swap_direction)
+          lgen_local.next while lgen_local.current.first.row != @pos.row && lgen_local.next?
+          rgen_local.next while rgen_local.current.first.column != @pos.column && rgen_local.next?
+          
+          val = 0
+          
+          while (lgen_local.current.first.row == @pos.row && rgen_local.current.first.column == @pos.column )
+            case lgen_local.current.first.column <=> rgen_local.current.first.row
+            when -1
+              lgen_local.next if lgen_local.next?
+            when 1
+              rgen_local.next if rgen_local.next?
+            when 0
+              val += lgen_local.current.last * rgen_local.current.last
+              lgen_local.next if lgen_local.next?
+              rgen_local.next if rgen_local.next?
+            end
+          end
+          
+          @current = [@pos, val]
         end
+      else
+        @current = @gen.current
+        @pos ||= @current.first 
+        @gen.next if @gen.next?
       end
+      current
     end
     
     def next?
       @generators.any?{|i| i.next?}
     end
     
+    def end?
+      @generators.all?{|i| i.end?}
+    end
+    
     def each
-      while next?
-        yield self.next
+      while !end?
+        yield self.current
+        self.next
       end
+    end
+    
+    def rewind
+      @generators.each{|g| g.rewind}
     end
     
   end
   
-  attr_accessor :in_memory
-  attr_reader :row_size, :column_size, :sexp
+  attr_reader :row_size, :column_size, :sexp, :generator
   
-  def initialize(rows, columns = rows, operation = nil, lval = nil, rval = nil)
+  def initialize(rows, columns = rows, options = {})
     @row_size = rows
     @column_size = columns
-    @generators = [@in_memory = InMemory.new]
-    @sexp = if operation
-      [operation, lval, rval]
+    @generator = options[:generator] || InMemory.new
+    @sexp = if options[:operation]
+      [options[:operation], options[:lval], options[:rval]]
     else
       [self]
     end
   end
   
-  def add_generator(generator)
-    @generators << generator
-  end
-  
-  def all_by_row
-    gen = MultiGeneratorGenerator.new(@generators.collect{|g| g.by_row }, :rows)
-    block_given? ? gen.each{|p, v| yield p, v} : gen
-  end
-  
-  def all_by_column
-    gen = MultiGeneratorGenerator.new(@generators.collect{|g| g.by_column }, :columns)
-    block_given? ? gen.each{|p, v| yield p, v} : gen
-  end
-  
-  def row(r)
-    if block_given?
-      all_by_row{|i,j,v| yield j,v if i == r; break if r < i}
-    else
-      result = []
-      row(r) {|j,v| result << [j, v]}
-      result
-    end
-  end
-
-  def column(c)
-    if block_given?
-      @in_memory.by_column.each{|i,j,v| yield i,v if j == r; break if r < j}
-    else
-      result = []
-      column(c) {|i,v| result << [i, v]}
-      result
-    end
-  end
-
-
-  def regular?
-    not determinant.zero?
-  end
-
   def singular?
     not regular?
   end
@@ -160,17 +245,17 @@ class SparseMatrix
 
   def *(m)
     raise unless column_size == m.row_size
-    SparseMatrix.new(row_size, m.column_size, :*, self, m)
+    Smatrix.new(row_size, column_size, :operation => :*, :lval => self, :rval => m)
   end
   
   def +(m)
     raise unless row_size == m.row_size && column_size == m.column_size
-    SparseMatrix.new(row_size, column_size, :+, self, m)
+    Smatrix.new(row_size, column_size, :operation => :+, :lval => self, :rval => m)
   end
   
   def -(m)
     raise unless row_size == m.row_size && column_size == m.column_size
-    SparseMatrix.new(row_size, column_size, :-, self, m)
+    Smatrix.new(row_size, column_size, :-, self, m)
   end
   
   def range(left,right, direction = :row)
@@ -189,118 +274,10 @@ class SparseMatrix
     end
   end
   
-  def result(options = {})
-    output = options.delete(:output)
-    direction = options.delete(:direction)
-    pos = [1, 1]
-    case @sexp.size
-    when 1
-      rows = all_by_row
-      while rows.next?
-        (next_pos, next_val) = rows.next
-        range(incr(pos), next_pos) do |intermediary_pos|
-          yield intermediary_pos, 0
-        end if output == :full
-        yield rows.current
-        pos = rows.current.first
-      end
-      range(incr(pos), [row_size, column_size]) do |intermediary_pos|
-        yield intermediary_pos, 0
-      end if output == :full
-    when 3
-      case @sexp.first
-      when :+, :-
-        rows1 = @sexp[1].result(:output => output, direction => :rows)
-        rows2 = @sexp[2].result(:output => output, direction => :rows)
-        while rows1.next? && rows2.next?
-          (pos1, val1) = rows1.next
-          (pos2, val2) = rows2.next
-          case Comparators[:row].call(pos1, pos2)
-          when -1:
-            yield rows1.current
-            pos = rows1.current.first
-          when 1:
-            yield rows2.current
-            pos = rows2.current.first
-          when 0:
-            yield rows1.current.first, @sexp.first == :+ ? rows1.current.last + rows2.current.last : rows1.current.last - rows2.current.last
-            pos = rows2.current.first
-          end
-          range(incr(pos), next_pos) do |intermediary_pos|
-            yield intermediary_pos, 0
-          end if output == :full
-        end
-        range(incr(pos), [row_size, column_size]) do |intermediary_pos|
-          yield intermediary_pos, 0
-        end if output == :full
-      when :*, :/
-        rows1 = @sexp[1].all_by_row
-        rows2 = @sexp[2].all_by_column
-        while rows1.next? && rows2.next?
-          (pos1, val1) = rows1.next
-          (pos2, val2) = rows2.next
-          case Comparators[:row].call(pos1, pos2.reverse)
-          when -1:
-            yield pos1, 0 if output == :full
-            pos = rows1.current.first
-          when 1:
-            raise if @sexp.first == :/
-            yield pos2.current.first.reverse, 0 if output == :full
-            pos = rows2.current.first.reverse
-          when 0:
-            yield rows1.current.first, @sexp.first == :* ? rows1.current.last * rows2.current.last : rows1.current.last / rows2.current.last
-            pos = rows1.current.first
-          end
-          range(incr(pos), next_pos) do |intermediary_pos|
-            yield intermediary_pos, 0
-          end if output == :full
-        end
-        range(incr(pos), [row_size, column_size]) do |intermediary_pos|
-          yield intermediary_pos, 0
-        end if output == :full
-      end
-    end    
-    #      
-    #    end
-    #  else
-    #    raise "unsupported operation #{@sexp.first}"
-    #  end
+  def by(direction = :row)
+    gen = SexpGenerator.new(self, :direction => direction)
+    block_given? ? gen.each{|p, v| yield p, v} : gen
   end
-  
-#  def *(m)
-#    result = SparseMatrix.new
-#    self.by_column
-#  end
-#    
-#      * *(m)
-#      * +(m)
-#      * -(m)
-#      * #/(m)
-#      * inverse
-#      * inv
-#      * **
-#
-#  Matrix functions:
-#
-#      * determinant
-#      * det
-#      * rank
-#      * trace
-#      * tr
-#      * transpose
-#      * t
-#
-#  Conversion to other data types:
-#
-#      * coerce(other)
-#      * row_vectors
-#      * column_vectors
-#      * to_a
-#
-#  String representations:
-#
-#      * to_s
-#      * inspect
-#  
+  alias :result :by
   
 end
